@@ -1,0 +1,78 @@
+name: Build & Release for Ubuntu 24.04
+
+on:
+  push:
+    branches: [ main, master ]
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-ubuntu-2404:
+    name: Build on Ubuntu 24.04 LTS
+    runs-on: ubuntu-24.04
+
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+
+    - name: Set up Python 3.10
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
+        cache: 'pip'
+
+    - name: Install System Dependencies (Ubuntu 24.04 LTS)
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends \
+          libgl1 \
+          libglx-mesa0 \
+          libgl1-mesa-dri \
+          libegl1 \
+          libxcb-cursor0 \
+          libxcb-xinerama0 \
+          libxkbcommon-x11-0 \
+          libpulse0 \
+          libasound2t64 \
+          patchelf
+
+    - name: Install Python Dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+
+    - name: Build Application with PyInstaller
+      run: |
+        pyinstaller --clean nexarm.spec
+
+    - name: Package Release Bundle
+      run: |
+        mkdir -p release/NexArm-Ubuntu-24.04
+        cp dist/NexArm release/NexArm-Ubuntu-24.04/
+        cp -r STL release/NexArm-Ubuntu-24.04/ || true
+        cp -r ui release/NexArm-Ubuntu-24.04/ || true
+        cp nexarm_icon.png release/NexArm-Ubuntu-24.04/ || true
+        cp coord_axes.png release/NexArm-Ubuntu-24.04/ || true
+        cp 0.842.png release/NexArm-Ubuntu-24.04/ || true
+        chmod +x release/NexArm-Ubuntu-24.04/NexArm
+        tar -czvf NexArm-Ubuntu-24.04-x86_64.tar.gz -C release NexArm-Ubuntu-24.04
+
+    - name: Upload Build Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: NexArm-Ubuntu-24.04-x86_64
+        path: NexArm-Ubuntu-24.04-x86_64.tar.gz
+        if-no-files-found: error
+
+    - name: Create GitHub Release
+      if: startsWith(github.ref, 'refs/tags/')
+      uses: softprops/action-gh-release@v2
+      with:
+        files: NexArm-Ubuntu-24.04-x86_64.tar.gz
+        generate_release_notes: true
+        draft: false
+        prerelease: false

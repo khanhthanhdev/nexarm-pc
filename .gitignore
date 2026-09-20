@@ -1,0 +1,27 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# PyInstaller / Build outputs
+build/
+dist/
+release/
+*.spec.bak
+*.tar.gz
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# Large extracted artifacts & binary
+NexArm.exe
+NexArm.exe_extracted/
+
+# IDE / OS files
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
