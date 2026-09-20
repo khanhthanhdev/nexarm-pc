@@ -182,6 +182,7 @@ class CoordTab(QWidget):
         else:
             self.setup_ui_manual()
 
+    def setup_ui_from_file(self):
         mapping = {
             'X': 'spin_x',
             'Y': 'spin_y',
@@ -193,38 +194,36 @@ class CoordTab(QWidget):
         for k, name in mapping.items():
             if hasattr(self, name):
                 self.inputs[k] = getattr(self, name)
-        else:
-            if hasattr(self, "btn_z_plus"):
-                self.btn_z_plus.setAutoRepeat(True)
-                self.btn_z_plus.setAutoRepeatDelay(400)
-                self.btn_z_plus.setAutoRepeatInterval(200)
-                self.btn_z_plus.clicked.connect(lambda: self.adjust_coord("Z", 1))
-            elif hasattr(self, "btn_z_minus"):
-                self.btn_z_minus.setAutoRepeat(True)
-                self.btn_z_minus.setAutoRepeatDelay(400)
-                self.btn_z_minus.setAutoRepeatInterval(200)
-                self.btn_z_minus.clicked.connect(lambda: self.adjust_coord("Z", -1))
-            if hasattr(self, "btn_pitch_plus"):
-                self.btn_pitch_plus.setAutoRepeat(True)
-                self.btn_pitch_plus.setAutoRepeatDelay(400)
-                self.btn_pitch_plus.setAutoRepeatInterval(200)
-                self.btn_pitch_plus.clicked.connect(lambda: self.adjust_coord("Pitch", 1))
-            if hasattr(self, "btn_pitch_minus"):
-                self.btn_pitch_minus.setAutoRepeat(True)
-                self.btn_pitch_minus.setAutoRepeatDelay(400)
-                self.btn_pitch_minus.setAutoRepeatInterval(200)
-                self.btn_pitch_minus.clicked.connect(lambda: self.adjust_coord("Pitch", -1))
-            if hasattr(self, "btn_send"):
-                self.btn_send.clicked.connect(self.send_coordinate_move)
-            if hasattr(self, "btn_get"):
-                self.btn_get.clicked.connect(lambda: self.comm_manager.send_sys(CMD_GET_CUR_COORDS))
-            if hasattr(self, "wheel") and hasattr(self.wheel, "clicked"):
-                try:
-                    self.wheel.clicked.disconnect()
-                except:
-                    pass
-                else:
-                    self.wheel.clicked.connect(self.handle_wheel_click)
+        if hasattr(self, "btn_z_plus"):
+            self.btn_z_plus.setAutoRepeat(True)
+            self.btn_z_plus.setAutoRepeatDelay(400)
+            self.btn_z_plus.setAutoRepeatInterval(200)
+            self.btn_z_plus.clicked.connect(lambda: self.adjust_coord("Z", 1))
+        if hasattr(self, "btn_z_minus"):
+            self.btn_z_minus.setAutoRepeat(True)
+            self.btn_z_minus.setAutoRepeatDelay(400)
+            self.btn_z_minus.setAutoRepeatInterval(200)
+            self.btn_z_minus.clicked.connect(lambda: self.adjust_coord("Z", -1))
+        if hasattr(self, "btn_pitch_plus"):
+            self.btn_pitch_plus.setAutoRepeat(True)
+            self.btn_pitch_plus.setAutoRepeatDelay(400)
+            self.btn_pitch_plus.setAutoRepeatInterval(200)
+            self.btn_pitch_plus.clicked.connect(lambda: self.adjust_coord("Pitch", 1))
+        if hasattr(self, "btn_pitch_minus"):
+            self.btn_pitch_minus.setAutoRepeat(True)
+            self.btn_pitch_minus.setAutoRepeatDelay(400)
+            self.btn_pitch_minus.setAutoRepeatInterval(200)
+            self.btn_pitch_minus.clicked.connect(lambda: self.adjust_coord("Pitch", -1))
+        if hasattr(self, "btn_send"):
+            self.btn_send.clicked.connect(self.send_coordinate_move)
+        if hasattr(self, "btn_get"):
+            self.btn_get.clicked.connect(lambda: self.comm_manager.send_sys(CMD_GET_CUR_COORDS))
+        if hasattr(self, "wheel") and hasattr(self.wheel, "clicked"):
+            try:
+                self.wheel.clicked.disconnect()
+            except Exception:
+                pass
+            self.wheel.clicked.connect(self.handle_wheel_click)
 
     def setup_ui_manual(self):
         outer = QVBoxLayout(self)

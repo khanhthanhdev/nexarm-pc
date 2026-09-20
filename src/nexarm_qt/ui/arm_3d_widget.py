@@ -138,134 +138,446 @@ class Arm3DWidget(QWidget):
         super().__init__(parent)
         self.comm_manager = comm_manager
         self.lang = lang
-        self.links = []
-        self.joints = []
+        self._servo_home = [2048, 2088, 1198, 1238, 2048, 2048]
         self.joint_angles = [0.0] * 6
+        self._servo_to_angles(self._servo_home)
+        self._send_enabled = True
         self.mesh_items = {}
-        self.coord_inputs = {}
+
+        import sys
+        if hasattr(sys, '_MEIPASS'):
+            urdf_path = os.path.join(sys._MEIPASS, 'ui', 'nexarm.urdf')
+        else:
+            urdf_path = os.path.join(os.path.dirname(__file__), 'nexarm.urdf')
+            if not os.path.exists(urdf_path):
+                base_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+                urdf_path = os.path.join(base_dir, 'ui', 'nexarm.urdf')
+
+        self.links_info, self.joints = parse_urdf(urdf_path)
+        self.fixed_joints = self._parse_fixed_joints(urdf_path)
+        self.link_order = ['base_link'] + [j['child'] for j in self.joints]
+        for fj in self.fixed_joints:
+            if fj['child'] not in self.link_order and fj['child'] not in SKIP_LINKS:
+                self.link_order.append(fj['child'])
 
         self._build_ui()
+        self._meshes_ready.connect(self._on_meshes_ready)
+        self._load_progress.connect(self.spinner.set_progress)
         self._start_bg_load()
 
-        if self.comm_manager:
+        if self.comm_manager and hasattr(self.comm_manager, 'coord_updated'):
             self.comm_manager.coord_updated.connect(self._on_coord_updated)
 
-    def _build_ui(self):
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-
-        self.stack = QStackedWidget()
-        self.spinner = SpinnerWidget()
-        self.stack.addWidget(self.spinner)
-
-        if gl:
-            self.view = gl.GLViewWidget()
-            self.view.setBackgroundColor(QColor(30, 30, 40))
-            self.view.setCameraPosition(distance=1500, elevation=30, azimuth=45)
-            grid = gl.GLGridItem()
-            grid.scale(50, 50, 1)
-            self.view.addItem(grid)
-            axis = gl.GLAxisItem()
-            axis.setSize(x=200, y=200, z=200)
-            self.view.addItem(axis)
-            self.stack.addWidget(self.view)
-        else:
-            lbl = QLabel("PyOpenGL / pyqtgraph not installed")
-            self.stack.addWidget(lbl)
-
-        layout.addWidget(self.stack)
-
-    def _start_bg_load(self):
-        self.spinner.start()
-        threading.Thread(target=self._load_meshes_worker, daemon=True).start()
-        self._meshes_ready.connect(self._on_meshes_ready)
-
-    def _load_meshes_worker(self):
-        base_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-        urdf_path = os.path.join(base_dir, "ui", "nexarm.urdf")
-        stl_dir = os.path.join(base_dir, "STL")
-
+    def _parse_fixed_joints(self, urdf_path):
+        """Parse ALL non-revolute-chain joints (fixed + gripper revolute/prismatic)."""
+        fjoints = []
         if not os.path.exists(urdf_path):
-            urdf_path = os.path.join(base_dir, "..", "ui", "nexarm.urdf")
-            stl_dir = os.path.join(base_dir, "..", "STL")
-
-        mesh_data_list = []
-        if os.path.exists(urdf_path):
-            try:
-                self.links, self.joints = parse_urdf(urdf_path, stl_dir)
-                for i, link in enumerate(self.links):
-                    mesh_p = link.get("mesh_path")
-                    if mesh_p and os.path.exists(mesh_p):
-                        verts, faces = load_stl_full(mesh_p)
-                        color = LINK_COLORS[i % len(LINK_COLORS)]
-                        mesh_data_list.append((link["name"], verts, faces, color))
-            except Exception as e:
-                print(f"URDF load error: {e}")
-
-        self._meshes_ready.emit(mesh_data_list)
-
-    def _on_meshes_ready(self, mesh_data_list):
-        self.spinner.stop()
-        if gl and hasattr(self, 'view'):
-            for name, verts, faces, color in mesh_data_list:
-                if len(verts) > 0 and len(faces) > 0:
-                    item = gl.GLMeshItem(vertexes=verts, faces=faces, smooth=True, color=color, shader='shaded')
-                    self.mesh_items[name] = item
-                    self.view.addItem(item)
-            self.stack.setCurrentIndex(1)
-            self._update_model()
-        else:
-            self.stack.setCurrentIndex(1)
+            return fjoints
+        tree = ET.parse(urdf_path)
+        chain_children = {j['child'] for j in self.joints}
+        chain_children.add('base_link')
+        for je in tree.getroot().findall('joint'):
+            child_el = je.find('child')
+            if child_el is None:
+                continue
+            child = child_el.get('link')
+            if child in chain_children or child in SKIP_LINKS:
+                continue
+            jtype = je.get('type', 'fixed')
+            origin = je.find('origin')
+            if origin is not None:
+                xyz = [float(v) for v in origin.get('xyz', '0 0 0').split()]
+                rpy = [float(v) for v in origin.get('rpy', '0 0 0').split()]
+            else:
+                xyz = [0.0, 0.0, 0.0]
+                rpy = [0.0, 0.0, 0.0]
+            axis_el = je.find('axis')
+            if axis_el is not None:
+                axis = [float(v) for v in axis_el.get('xyz', '0 0 1').split()]
+            else:
+                axis = [0.0, 0.0, 1.0]
+            parent_el = je.find('parent')
+            parent_link = parent_el.get('link') if parent_el is not None else ''
+            fjoints.append({
+                'name': je.get('name', ''),
+                'type': jtype,
+                'parent': parent_link,
+                'child': child,
+                'origin_xyz': xyz,
+                'origin_rpy': rpy,
+                'axis': axis
+            })
+        return fjoints
 
     def _servo_to_angles(self, servo_vals):
         for i in range(min(6, len(servo_vals))):
             deg = (servo_vals[i] - self.SERVO_CENTER[i]) * self.SERVO_RATIO[i] * self.SERVO_DIR[i] * self.URDF_DIR[i]
             self.joint_angles[i] = math.radians(deg)
 
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        self.stack = QStackedWidget()
+        self.spinner = SpinnerWidget()
+        self.stack.addWidget(self.spinner)
+
+        self.gl_widget = gl.GLViewWidget() if gl else QWidget()
+        if gl:
+            self.gl_widget.setBackgroundColor(200, 200, 210)
+            self.gl_widget.setCameraPosition(distance=500, elevation=25, azimuth=-50)
+            g = gl.GLGridItem()
+            g.setSize(600, 600)
+            g.setSpacing(50, 50)
+            g.setColor((120, 120, 130, 160))
+            self.gl_widget.addItem(g)
+            ax = gl.GLAxisItem()
+            ax.setSize(80, 80, 80)
+            self.gl_widget.addItem(ax)
+
+        self.stack.addWidget(self.gl_widget)
+        self.stack.setCurrentIndex(0)
+        self.spinner.start()
+
+        hsplit = QHBoxLayout()
+        hsplit.addWidget(self.stack, stretch=5)
+
+        ctrl_panel = QWidget()
+        ctrl_panel.setMinimumWidth(340)
+        ctrl_panel.setMaximumWidth(420)
+        ctrl_panel.setStyleSheet("""
+            background: rgba(30,30,40,0.95); border-radius: 6px;
+        """)
+        cp = QVBoxLayout(ctrl_panel)
+        cp.setContentsMargins(16, 12, 16, 12)
+        cp.setSpacing(10)
+
+        title_row = QHBoxLayout()
+        arm_icon = QLabel()
+        arm_icon.setStyleSheet("background: transparent; border: none;")
+        import sys
+        if hasattr(sys, '_MEIPASS'):
+            icon_path = os.path.join(sys._MEIPASS, 'ui', '0.842.png')
+            if not os.path.exists(icon_path):
+                icon_path = os.path.join(sys._MEIPASS, '0.842.png')
+        else:
+            icon_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), '0.842.png')
+        if os.path.exists(icon_path):
+            pix = QPixmap(icon_path)
+            if not pix.isNull():
+                arm_icon.setPixmap(pix.scaled(22, 24, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+                arm_icon.setFixedSize(22, 24)
+        title_row.addWidget(arm_icon)
+
+        self.coord_title = QLabel(STRINGS[self.lang].get('grp_coord_ik', '坐标控制 (IK)'))
+        self.coord_title.setStyleSheet("color: #FA8F01; font-weight: bold; font-size: 10pt; background: transparent; border: none;")
+        title_row.addWidget(self.coord_title)
+        title_row.addStretch()
+        cp.addLayout(title_row)
+
+        sep = QFrame()
+        sep.setFrameShape(QFrame.HLine)
+        sep.setStyleSheet("color: #444; background: transparent;")
+        cp.addWidget(sep)
+
+        coord_w = QWidget()
+        coord_w.setStyleSheet("""
+            QSpinBox, QDoubleSpinBox {
+                font-size: 10pt; padding: 6px 8px;
+                background: #343645; color: white;
+                border: 1px solid #4A4D5E; border-radius: 4px;
+                selection-background-color: #FA8F01;
+                min-height: 28pt;
+            }
+            QSpinBox:focus, QDoubleSpinBox:focus {
+                border: 2px solid #FA8F01;
+                background: #3A3C4D;
+            }
+            QLabel { background: transparent; border: none; }
+        """)
+        cg = QGridLayout(coord_w)
+        cg.setSpacing(6)
+        cg.setContentsMargins(0, 0, 0, 0)
+
+        coord_fields = [
+            ('X', 0, 550, 220, False),
+            ('Y', -550, 550, 0, False),
+            ('Z', 100, 570, 200, False),
+            ('Pitch', -1000.0, 1000.0, 0.0, True),
+            ('Roll', -90, 90, 0, False),
+            ('Claw', -60.0, 30.0, 0.0, True),
+            ('Time', 0, 1000000, 1000, False),
+        ]
+        self.coord_inputs = {}
+        for idx, (name, lo, hi, default, is_float) in enumerate(coord_fields):
+            lbl = QLabel(name)
+            lbl.setStyleSheet("color: #B0BEC5; font-size: 9pt; font-weight: 500;")
+            lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            lbl.setFixedWidth(48)
+            if is_float:
+                sb = QDoubleSpinBox()
+                sb.setDecimals(1)
+                sb.setRange(float(lo), float(hi))
+                sb.setValue(float(default))
+            else:
+                sb = QSpinBox()
+                sb.setRange(int(lo), int(hi))
+                sb.setValue(int(default))
+            sb.setReadOnly(False)
+            sb.setKeyboardTracking(False)
+            sb.setFocusPolicy(Qt.StrongFocus)
+            sb._saved_value = sb.value()
+            sb.installEventFilter(self)
+            self.coord_inputs[name] = sb
+            cg.addWidget(lbl, idx, 0)
+            cg.addWidget(sb, idx, 1)
+
+        cp.addWidget(coord_w)
+
+        btn_row = QHBoxLayout()
+        self.btn_send_coord = QPushButton(STRINGS[self.lang].get('btn_send_ik', '发送坐标'))
+        self.btn_send_coord.setStyleSheet("background-color: #FF8F00; color: white; padding: 8px 16px; font-size: 9pt; font-weight: bold; border-radius: 4px; border: none; min-height: 24pt;")
+        self.btn_send_coord.clicked.connect(self._send_coordinate)
+        btn_row.addWidget(self.btn_send_coord)
+
+        self.btn_home = QPushButton(STRINGS[self.lang].get('btn_ik_home', '回中'))
+        self.btn_home.setStyleSheet("background-color: #455A64; color: white; padding: 8px 16px; font-size: 9pt; border-radius: 4px; border: none; min-height: 24pt;")
+        self.btn_home.clicked.connect(self._home_all)
+        btn_row.addWidget(self.btn_home)
+        cp.addLayout(btn_row)
+
+        sep2 = QFrame()
+        sep2.setFrameShape(QFrame.HLine)
+        sep2.setStyleSheet("color: #444; background: transparent;")
+        cp.addWidget(sep2)
+
+        self.servo_title = QLabel(STRINGS[self.lang].get('lbl_realtime_servo', '实时舵机'))
+        self.servo_title.setStyleSheet("color: #FA8F01; font-weight: bold; font-size: 9pt; background: transparent; border: none;")
+        cp.addWidget(self.servo_title)
+
+        sg = QGridLayout()
+        sg.setSpacing(4)
+        sg.setContentsMargins(0, 0, 0, 0)
+        self.sliders = []
+        self.slider_labels = []
+        for i in range(6):
+            row = i // 3
+            col = i % 3
+            lbl = QLabel(f"ID{i + 1}")
+            lbl.setStyleSheet("color: #78909C; font-size: 8pt; background: transparent; border: none;")
+            lbl.setAlignment(Qt.AlignCenter)
+            sg.addWidget(lbl, row * 2, col)
+
+            vl = QLabel(f"{self._servo_home[i]}")
+            vl.setAlignment(Qt.AlignCenter)
+            vl.setStyleSheet("color: #FA8F01; font-size: 9pt; font-weight: bold; background: rgba(250,143,1,0.1); padding: 4px 8px; border-radius: 4px; border: none;")
+            self.slider_labels.append(vl)
+            sg.addWidget(vl, row * 2 + 1, col)
+
+        sg.setColumnStretch(0, 1)
+        sg.setColumnStretch(1, 1)
+        sg.setColumnStretch(2, 1)
+        cp.addLayout(sg)
+
+        self.lbl_cur_coord = QLabel("")
+        self.lbl_cur_coord.setStyleSheet("color: #78909C; font-size: 8pt; background: transparent; border: none;")
+        self.lbl_cur_coord.setWordWrap(True)
+        cp.addWidget(self.lbl_cur_coord)
+
+        cp.addStretch()
+        hsplit.addWidget(ctrl_panel, stretch=0)
+        layout.addLayout(hsplit, stretch=1)
+
+    def _start_bg_load(self):
+        def _load():
+            ci = 0
+            result = []
+            valid_links = [name for name in self.link_order if name not in SKIP_LINKS and self.links_info.get(name) and self.links_info[name].get('stl_path')]
+            total = len(valid_links)
+            loaded = 0
+            for name in self.link_order:
+                if name in SKIP_LINKS:
+                    ci += 1
+                    continue
+                info = self.links_info.get(name)
+                if not info or not info.get('stl_path'):
+                    ci += 1
+                    continue
+                try:
+                    prog_text = STRINGS.get(self.lang, STRINGS['zh']).get('lbl_loading_progress', 'Loading {loaded}/{total}: {name}').format(
+                        loaded=loaded + 1, total=total, name=name
+                    )
+                    self._load_progress.emit(prog_text)
+                    verts, faces = load_stl_full(info['stl_path'])
+                    color = LINK_COLORS[ci % len(LINK_COLORS)]
+                    result.append((name, verts, faces, color))
+                    loaded += 1
+                except Exception as e:
+                    print(f'[3D] load {name}: {e}')
+                ci += 1
+
+            done_text = STRINGS.get(self.lang, STRINGS['zh']).get('lbl_loading_done', 'Done! {loaded} models loaded').format(loaded=loaded)
+            self._load_progress.emit(done_text)
+            self._meshes_ready.emit(result)
+
+        threading.Thread(target=_load, daemon=True).start()
+
+    def _on_meshes_ready(self, mesh_data_list):
+        self.mesh_items = {}
+        self._pending_meshes = mesh_data_list
+        self._mesh_batch_idx = 0
+        self._batch_timer = QTimer(self)
+        self._batch_timer.timeout.connect(self._load_next_mesh_batch)
+        self._batch_timer.start(10)
+
+    def _load_next_mesh_batch(self):
+        """Load one mesh per timer tick to keep UI responsive."""
+        if self._mesh_batch_idx >= len(self._pending_meshes):
+            self._batch_timer.stop()
+            self._update_model()
+            self.spinner.stop()
+            self.stack.setCurrentIndex(1)
+            print(f'[3D] Ready: {len(self.mesh_items)} meshes')
+            return
+        name, verts, faces, color = self._pending_meshes[self._mesh_batch_idx]
+        try:
+            if gl:
+                md = gl.MeshData(vertexes=verts, faces=faces)
+                item = gl.GLMeshItem(meshdata=md, smooth=True, color=color, shader='shaded', glOptions='opaque')
+                self.gl_widget.addItem(item)
+                self.mesh_items[name] = item
+            rend = STRINGS.get(self.lang, STRINGS['zh']).get('lbl_rendering', 'Rendering...')
+            self.spinner.set_progress(f'{rend} {self._mesh_batch_idx + 1}/{len(self._pending_meshes)}: {name}')
+        except Exception as e:
+            print(f'[3D] mesh {name}: {e}')
+        self._mesh_batch_idx += 1
+
     def _compute_link_transforms(self):
-        transforms = {}
+        xf = {}
+        xf['base_link'] = np.eye(4)
         T = np.eye(4)
-        for i, joint in enumerate(self.joints):
-            angle = self.joint_angles[i] if i < len(self.joint_angles) else 0.0
-            T_joint = joint_transform(joint, angle)
-            T = T @ T_joint
-            transforms[joint["child"]] = T
-        return transforms
+        for i, jnt in enumerate(self.joints):
+            scaled = dict(jnt)
+            scaled['origin_xyz'] = [v * SCALE for v in jnt['origin_xyz']]
+            T = T @ joint_transform(scaled, self.joint_angles[i])
+            xf[jnt['child']] = T.copy()
+
+        claw_angle = self.joint_angles[5] if len(self.joint_angles) > 5 else 0.0
+        jaw_travel = -claw_angle * 0.02
+        remaining = list(self.fixed_joints)
+        for _ in range(5):
+            still_remaining = []
+            for fj in remaining:
+                parent_T = xf.get(fj['parent'])
+                if parent_T is None:
+                    still_remaining.append(fj)
+                    continue
+                T_origin = make_transform([v * SCALE for v in fj['origin_xyz']], fj['origin_rpy'])
+                jtype = fj.get('type', 'fixed')
+                if jtype == 'revolute' and 'gripper_base' in fj.get('name', ''):
+                    R = np.eye(4)
+                    R[:3, :3] = axis_angle_matrix(fj['axis'], claw_angle)
+                    xf[fj['child']] = parent_T @ T_origin @ R
+                elif jtype == 'prismatic' and 'jaw' in fj.get('name', ''):
+                    T_slide = np.eye(4)
+                    axis = np.array(fj['axis'], dtype=float)
+                    disp = jaw_travel * SCALE
+                    if 'left' in fj.get('name', ''):
+                        disp = -disp
+                    T_slide[:3, 3] = axis * disp
+                    xf[fj['child']] = parent_T @ T_origin @ T_slide
+                else:
+                    xf[fj['child']] = parent_T @ T_origin
+            remaining = still_remaining
+            if not remaining:
+                break
+        return xf
 
     def _update_model(self):
         if not self.mesh_items:
             return
-        transforms = self._compute_link_transforms()
+        xf = self._compute_link_transforms()
         for name, item in self.mesh_items.items():
-            if name in transforms:
-                item.setTransform(np44_to_qmatrix(transforms[name]))
+            T = xf.get(name, np.eye(4))
+            item.setTransform(np44_to_qmatrix(T))
 
     def _slider_moved(self, idx, val_deg):
-        if idx < len(self.joint_angles):
-            self.joint_angles[idx] = math.radians(val_deg)
-            self._update_model()
-
-    def _send_joint(self, idx, angle_deg):
-        if self.comm_manager:
-            self.comm_manager.send_sys(CMD_SET_SINGLE_MOTOR, [idx + 1, int(angle_deg)])
-
-    def _send_coordinate(self):
         pass
 
+    def _send_joint(self, idx, angle_deg):
+        pass
+
+    def _send_coordinate(self):
+        """Send coordinate command using IK interface — same as coord_tab."""
+        try:
+            for sp in self.coord_inputs.values():
+                sp._saved_value = sp.value()
+            p = int(self.coord_inputs['Pitch'].value() * 10)
+            x = int(self.coord_inputs['X'].value())
+            y = int(self.coord_inputs['Y'].value())
+            z = int(self.coord_inputs['Z'].value())
+            r = int(self.coord_inputs['Roll'].value())
+            c = int(self.coord_inputs['Claw'].value())
+            t = int(self.coord_inputs['Time'].value())
+            args = list(struct.pack('<hhhhhhH', p, x, y, z, r, c, t))
+            self.comm_manager.send_sys(CMD_COORDINATE_SET, args)
+        except Exception as e:
+            print(f'[3D] send coord error: {e}')
+
     def eventFilter(self, obj, event):
+        """焦点进入时记录值，焦点离开时保留用户修改"""
+        if event.type() == QEvent.FocusIn and isinstance(obj, (QSpinBox, QDoubleSpinBox)):
+            obj._saved_value = obj.value()
         return super().eventFilter(obj, event)
 
     def _on_coord_updated(self, x, y, z, pitch, roll, claw, servo_angles):
-        if servo_angles and len(servo_angles) >= 6:
-            self._servo_to_angles(servo_angles)
-            self._update_model()
+        if not servo_angles:
+            return
+        self.lbl_cur_coord.setText(f'X:{x}  Y:{y}  Z:{z}  Pitch:{pitch:.1f}  Roll:{roll}  Claw:{claw:.1f}')
+        self._servo_to_angles(servo_angles)
+        n = min(6, len(servo_angles), len(self.slider_labels))
+        for i in range(n):
+            self.slider_labels[i].setText(f'ID{i + 1}: {servo_angles[i]}')
+        self._update_model()
 
     def update_coord_inputs(self, x, y, z, pitch, roll, claw):
-        pass
+        """手动请求时才更新坐标输入框"""
+        for name, val in (('X', x), ('Y', y), ('Z', z), ('Roll', roll)):
+            sb = self.coord_inputs.get(name)
+            if sb:
+                sb.blockSignals(True)
+                sb.setValue(int(val))
+                sb._saved_value = int(val)
+                sb.blockSignals(False)
+        for name, val in (('Pitch', float(pitch)), ('Claw', float(claw))):
+            sb = self.coord_inputs.get(name)
+            if sb:
+                sb.blockSignals(True)
+                sb.setValue(val)
+                sb._saved_value = val
+                sb.blockSignals(False)
 
     def _home_all(self):
-        self.joint_angles = [0.0] * 6
-        self._update_model()
+        """Send home position coordinate."""
+        self.coord_inputs['X'].setValue(200)
+        self.coord_inputs['Y'].setValue(0)
+        self.coord_inputs['Z'].setValue(200)
+        self.coord_inputs['Pitch'].setValue(0.0)
+        self.coord_inputs['Roll'].setValue(0)
+        self.coord_inputs['Claw'].setValue(0.0)
+        self.coord_inputs['Time'].setValue(1000)
+        self._send_coordinate()
 
     def update_language(self, lang):
         self.lang = lang
+        s = STRINGS[lang]
+        if hasattr(self, 'servo_title'):
+            self.servo_title.setText(s.get('lbl_realtime_servo', 'Realtime Servo'))
+        if hasattr(self, 'coord_title'):
+            self.coord_title.setText(s.get('grp_coord_ik', 'Coordinate Control (IK)'))
+        if hasattr(self, 'btn_send_coord'):
+            self.btn_send_coord.setText(s.get('btn_send_ik', 'Send Coord'))
+        if hasattr(self, 'btn_home'):
+            self.btn_home.setText(s.get('btn_ik_home', 'Home'))
+

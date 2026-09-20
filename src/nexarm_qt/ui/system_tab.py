@@ -25,8 +25,16 @@ class SystemTab(QWidget):
 
     
     def setup_ui(self):
-        pass
-    # WARNING: Decompyle incomplete
+        if os.path.exists(UI_PATH):
+            try:
+                uic.loadUi(UI_PATH, self)
+                self.setup_ui_from_file()
+                print(f"Loaded UI from {UI_PATH}")
+            except Exception as e:
+                print(f"Error loading UI file: {e}")
+                self.setup_ui_manual()
+        else:
+            self.setup_ui_manual()
 
     
     def setup_ui_from_file(self):
@@ -271,8 +279,16 @@ class SystemTab(QWidget):
 
     
     def set_move_acc(self):
-        pass
-    # WARNING: Decompyle incomplete
+        try:
+            acc_val = self.spin_move_acc.value()
+            self.comm_manager.send_sys(CMD_SET_MOVE_ACC, [acc_val])
+            self._acc_settings.setValue('move_acc', acc_val)
+            self.btn_set_acc.setStyleSheet('background-color: #FA8F01; color: white; font-weight: bold;')
+            self.btn_set_acc.setText(STRINGS[self.lang].get('msg_set_success', 'Set OK'))
+            from PyQt5.QtCore import QTimer
+            QTimer.singleShot(1500, self._reset_acc_btn)
+        except Exception as e:
+            print(f'Set Move Acc Error: {e}')
 
     
     def _reset_acc_btn(self):
@@ -281,8 +297,21 @@ class SystemTab(QWidget):
 
     
     def set_buzzer(self):
-        pass
-    # WARNING: Decompyle incomplete
+        try:
+            if not self.buz_vars or len(self.buz_vars) < 4:
+                print('Buzzer widgets not properly initialized')
+                return
+            vals = []
+            for sp in self.buz_vars:
+                if sp is None:
+                    vals.append(0)
+                else:
+                    vals.append(int(sp.value()))
+            on_t, off_t, cnt, freq = vals
+            args = list(struct.pack('<IIHH', on_t, off_t, cnt, freq))
+            self.comm_manager.send_sys(CMD_BUZZER_SET, args)
+        except Exception as e:
+            print(f'Buzzer Error: {e}')
 
     
     def _build_coord_limits(self):
@@ -357,7 +386,7 @@ class SystemTab(QWidget):
         vals = [sp.value() for sp in self.coord_limit_spins]
         vals[6] = vals[6] * 10
         vals[7] = vals[7] * 10
-    # WARNING: Decompyle incomplete
+        self.comm_manager.send_sys(CMD_SET_COORD_LIMITS, list(struct.pack('<hhhhhhhhhhhh', *vals)))
 
     
     def update_coord_limits(self, xmin, xmax, ymin, ymax, zmin, zmax, pmin, pmax, rmin, rmax, cmin, cmax):
@@ -446,8 +475,21 @@ class SystemTab(QWidget):
 
     
     def set_chassis_config(self):
-        pass
-    # WARNING: Decompyle incomplete
+        try:
+            chassis_type = self.cb_chassis_type.currentIndex()
+            wheel_dia = self.spin_wheel_dia.value()
+            wheel_base = self.spin_wheel_base.value()
+            track_width = self.spin_track_width.value()
+            max_speed = self.spin_max_speed.value()
+            args = [chassis_type]
+            args += list(struct.pack('<f', wheel_dia))
+            args += list(struct.pack('<f', wheel_base))
+            args += list(struct.pack('<f', track_width))
+            args += [0, 0, 0, 0]
+            args += [max_speed & 0xFF]
+            self.comm_manager.send_sys(CMD_SET_CHASSIS_CONFIG, args)
+        except Exception as e:
+            print(f'Set Chassis Config Error: {e}')
 
     
     def update_chassis_config(self, chassis_type, wheel_dia, wheel_base, track_width, max_speed):
@@ -510,14 +552,36 @@ class SystemTab(QWidget):
 
     
     def send_kinematics_config(self):
-        pass
-    # WARNING: Decompyle incomplete
+        try:
+            keys = [
+                'linkage1', 'linkage2', 'linkage2_perp', 'linkage3',
+                'linkage3_perp', 'linkage4', 'fixed_offset', 'base_radius', 'base_high'
+            ]
+            args = []
+            for k in keys:
+                val = self.kin_spins[k].value()
+                args += list(struct.pack('<f', val))
+            self.comm_manager.send_sys(CMD_SET_KINEMATICS_PARAM, args)
+            print(f'[Kinematics] Sent: {{k: self.kin_spins[k].value() for k in keys}}')
+            self.btn_set_kin.setStyleSheet('background-color: #FA8F01; color: white; font-weight: bold;')
+            self.btn_set_kin.setText(STRINGS[self.lang].get('msg_set_success', '设置成功'))
+            from PyQt5.QtCore import QTimer
+            QTimer.singleShot(1500, self._reset_kin_btn)
+        except Exception as e:
+            print(f'Set Kinematics Error: {e}')
 
     
     def _reset_kin_btn(self):
         self.btn_set_kin.setStyleSheet('background-color: #1976D2; color: white; font-weight: bold;')
-        self.btn_set_kin.setText(STRINGS[self.lang].get('btn_set_kin', 'å†™å…¥å�‚æ•°'))
+        self.btn_set_kin.setText(STRINGS[self.lang].get('btn_set_kin', '写入参数'))
 
     
     def update_kinematics_config(self, params):
-        pass
+        """从从机回包更新运动学参数UI, params是9个float的列表"""
+        keys = [
+            'linkage1', 'linkage2', 'linkage2_perp', 'linkage3',
+            'linkage3_perp', 'linkage4', 'fixed_offset', 'base_radius', 'base_high'
+        ]
+        for k, v in zip(keys, params):
+            if k in self.kin_spins:
+                self.kin_spins[k].setValue(v)

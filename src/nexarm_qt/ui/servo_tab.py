@@ -775,11 +775,12 @@ class ServoTab(QWidget):
                 SERVO_REG_ACC,
                 a & 255,
                 p & 255,
-                p >> 8 & 255,
+                (p >> 8) & 255,
                 0,
                 0,
                 sp & 255,
-                sp >> 8 & 255]
+                (sp >> 8) & 255
+            ]
             self.comm_manager.send_packet(i + 1, SERVO_CMD_WRITE, args)
             current_pos[i] = p
             time.sleep(0.002)
@@ -788,7 +789,22 @@ class ServoTab(QWidget):
     
     def _highlight_action_row(self, row_idx):
         self.suppress_tree_preview = True
-    # WARNING: Decompyle incomplete
+        try:
+            for row in range(self.tree.topLevelItemCount()):
+                item = self.tree.topLevelItem(row)
+                if item is None:
+                    continue
+                for col in range(self.tree.columnCount()):
+                    if row == row_idx:
+                        item.setForeground(col, self._highlight_brush)
+                        item.setBackground(col, self._highlight_bg_brush)
+                    else:
+                        item.setForeground(col, QBrush())
+                        item.setBackground(col, QBrush())
+            if 0 <= row_idx < self.tree.topLevelItemCount():
+                self.tree.setCurrentItem(self.tree.topLevelItem(row_idx))
+        finally:
+            self.suppress_tree_preview = False
 
     
     def _build_action_frame_from_ui(self):
@@ -807,16 +823,18 @@ class ServoTab(QWidget):
         servos = frame.get('servos', [])
         normalized_servos = []
         for i in range(6):
-            src = servos[i] if i < len(servos) else { }
+            src = servos[i] if i < len(servos) else {}
             default_pos = start_pos[i] if start_pos is not None else 2048
             p = int(src.get('pos', default_pos))
             a = int(src.get('acc', 0))
             normalized_servos.append({
                 'pos': p,
-                'acc': a })
+                'acc': a
+            })
         return {
             'time': t_ms,
-            'servos': normalized_servos }
+            'servos': normalized_servos
+        }
 
     
     def _normalize_action_data_list(self):
@@ -868,8 +886,7 @@ class ServoTab(QWidget):
         if it:
             idx = int(it.text(0)) - 1
             if idx > 0:
-                self.action_data_list[idx] = self.action_data_list[idx - 1]
-                self.action_data_list[idx - 1] = self.action_data_list[idx]
+                self.action_data_list[idx], self.action_data_list[idx - 1] = self.action_data_list[idx - 1], self.action_data_list[idx]
                 self._normalize_action_data_list()
                 self.refresh_tree()
                 self.tree.blockSignals(True)
@@ -882,8 +899,7 @@ class ServoTab(QWidget):
         if it:
             idx = int(it.text(0)) - 1
             if idx < len(self.action_data_list) - 1:
-                self.action_data_list[idx] = self.action_data_list[idx + 1]
-                self.action_data_list[idx + 1] = self.action_data_list[idx]
+                self.action_data_list[idx], self.action_data_list[idx + 1] = self.action_data_list[idx + 1], self.action_data_list[idx]
                 self._normalize_action_data_list()
                 self.refresh_tree()
                 self.tree.blockSignals(True)
@@ -905,4 +921,206 @@ class ServoTab(QWidget):
 
     
     def sync_current_servo_positions(self):
-        pass
+        """切换到动作组页面时，同步当前舵机位置到滑杆"""
+        servos = getattr(self.comm_manager, 'last_servos', None)
+        if not servos or len(servos) < 6:
+            return
+        self.is_updating_ui = True
+        for i in range(min(6, len(servos))):
+            val = servos[i]
+            if i < len(self.sliders):
+                self.sliders[i].blockSignals(True)
+                self.sliders[i].setValue(val)
+                self.sliders[i].blockSignals(False)
+            if i < len(self.spin_pos):
+                self.spin_pos[i].blockSignals(True)
+                self.spin_pos[i].setValue(val)
+                self.spin_pos[i].blockSignals(False)
+            self.servo_vals[i] = val
+            if i < len(self.servo_widgets):
+                self.servo_widgets[i]._update_angle_display(val)
+        self.is_updating_ui = False
+
+    
+    def on_tree_select(self):
+        if self.suppress_tree_preview:
+            return
+        it = self.tree.currentItem()
+        if it:
+            try:
+                idx = int(it.text(0)) - 1
+                if not (0 <= idx < len(self.action_data_list)):
+                    return
+                self._normalize_action_data_list()
+                f = self.action_data_list[idx]
+                self.pending_servo_send = [False] * 6
+                self.is_updating_ui = True
+                self.ent_delay.setValue(f['time'])
+                for i, s in enumerate(f['servos']):
+                    p = s.get('pos', 2048)
+                    a = s.get('acc', 100)
+                    self.servo_vals[i] = p
+                    self.servo_acc[i] = a
+                    self.sliders[i].setValue(p)
+                    self.spin_pos[i].setValue(p)
+                    self.spin_acc[i].setValue(a)
+                    self.spin_spd[i].setValue(s.get('spd', 2000))
+                    self.servo_widgets[i]._update_angle_display(p)
+                self.is_updating_ui = False
+                if not self.is_online_running:
+                    threading.Thread(target=self._send_frame_preview, args=(f,), daemon=True).start()
+            except (ValueError, IndexError):
+                pass
+
+    
+    def calc_total_time(self):
+        self.lbl_total_time.setText(STRINGS[self.lang]['lbl_total_time'].format(sum(f['time'] for f in self.action_data_list)))
+
+    
+    def _show_online_run_finished(self):
+        self._highlight_action_row(-1)
+        QMessageBox.information(self, 'Run', STRINGS[self.lang]['msg_online_done'])
+
+    
+    def act_save(self):
+        fn, _ = QFileDialog.getSaveFileName(self, 'Save Action Group', '', 'NexArm Files (*.d6a)')
+        if fn:
+            try:
+                self._normalize_action_data_list()
+                with open(fn, 'w') as f:
+                    json.dump(self.action_data_list, f)
+            except Exception as e:
+                QMessageBox.critical(self, STRINGS[self.lang]['msg_error'], str(e))
+
+    
+    def act_load(self):
+        fn, _ = QFileDialog.getOpenFileName(self, 'Open Action Group', '', 'NexArm Files (*.d6a)')
+        if fn:
+            try:
+                with open(fn, 'r') as f:
+                    d = json.load(f)
+                self.action_data_list = []
+                for r in d:
+                    t = r.get('time', 1000)
+                    s = r.get('servos', [])
+                    if not s and isinstance(r, list):
+                        s = [{'pos': p, 'acc': 0} for p in r]
+                    elif s and isinstance(s[0], int):
+                        s = [{'pos': p, 'acc': 0} for p in s]
+                    else:
+                        s = [{'pos': item.get('pos', 2048), 'acc': item.get('acc', 0)} for item in s]
+                    frame = self._normalize_action_frame({'time': t, 'servos': s})
+                    self.action_data_list.append(frame)
+                self.refresh_tree()
+                self.calc_total_time()
+            except Exception as e:
+                QMessageBox.critical(self, STRINGS[self.lang]['msg_error'], str(e))
+
+    
+    def act_run_online(self):
+        if not self.action_data_list or self.is_online_running:
+            return
+        self._normalize_action_data_list()
+        self._online_stop_flag = False
+        self._online_loop_count = self.sb_loop.value()
+        threading.Thread(target=self._run_thread, daemon=True).start()
+
+    
+    def _stop_online_loop(self):
+        """停止在线循环执行"""
+        self._online_stop_flag = True
+
+    
+    def _calc_time_based_speed(self, start_pos, target_pos, move_time_ms):
+        distance = abs(int(target_pos) - int(start_pos))
+        if move_time_ms > 0:
+            calc_speed = int(distance * 1000.0 / float(move_time_ms) * 1.2)
+        else:
+            calc_speed = 3400
+        if calc_speed < 10:
+            calc_speed = 10
+        if calc_speed > 3400:
+            calc_speed = 3400
+        return calc_speed
+
+    
+    def _run_thread(self):
+        self.is_online_running = True
+        loop_target = getattr(self, '_online_loop_count', 1)
+        loop_done = 0
+        try:
+            while not getattr(self, '_online_stop_flag', False):
+                current_pos = self._get_actual_positions()
+                for step_idx, f in enumerate(self.action_data_list):
+                    if getattr(self, '_online_stop_flag', False):
+                        break
+                    self.online_run_step_changed.emit(step_idx)
+                    t_ms = max(0, int(f.get('time', 1000)))
+                    for i, s in enumerate(f['servos']):
+                        p = s.get('pos', 2048)
+                        a = s.get('acc', 0)
+                        sp = self._calc_time_based_speed(current_pos[i], p, t_ms)
+                        args = [
+                            SERVO_REG_ACC,
+                            a & 255,
+                            p & 255,
+                            (p >> 8) & 255,
+                            0,
+                            0,
+                            sp & 255,
+                            (sp >> 8) & 255
+                        ]
+                        self.comm_manager.send_packet(i + 1, SERVO_CMD_WRITE, args)
+                        current_pos[i] = p
+                        time.sleep(0.002)
+                    wait_end = time.time() + t_ms / 1000.0
+                    while time.time() < wait_end:
+                        if getattr(self, '_online_stop_flag', False):
+                            break
+                        time.sleep(0.05)
+                self.latest_actual_positions = list(current_pos)
+                loop_done += 1
+                if loop_target > 0 and loop_done >= loop_target:
+                    break
+        finally:
+            self.is_online_running = False
+        self.online_run_finished.emit()
+
+    
+    def act_stop(self):
+        """停止动作组运行"""
+        print('[STOP] sending CMD_ACTION_GROUP_STOP')
+        self.comm_manager.send_sys(CMD_ACTION_GROUP_STOP)
+
+    
+    def act_dl(self):
+        if not self.action_data_list:
+            return
+        self._normalize_action_data_list()
+        gid = self.sb_gid.value()
+        tot = len(self.action_data_list)
+        current_pos = self._get_actual_positions()
+        for i, f in enumerate(self.action_data_list):
+            t = max(0, int(f.get('time', 1000)))
+            args = [gid, tot, i + 1, 6, t & 255, (t >> 8) & 255]
+            for j, s in enumerate(f['servos']):
+                p = s.get('pos', 2048)
+                a = s.get('acc', 0)
+                sp = self._calc_time_based_speed(current_pos[j], p, t)
+                args.extend([
+                    j + 1,
+                    p & 255,
+                    (p >> 8) & 255,
+                    a & 255,
+                    sp & 255,
+                    (sp >> 8) & 255
+                ])
+                current_pos[j] = p
+            self.comm_manager.send_sys(CMD_ACTION_GROUP_DOWNLOAD, args)
+            time.sleep(0.15)
+        self.latest_actual_positions = list(current_pos)
+        QMessageBox.information(
+            self,
+            'Download',
+            STRINGS[self.lang]['msg_download_complete'].format(gid, tot)
+        )

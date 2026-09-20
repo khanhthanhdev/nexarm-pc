@@ -1,6 +1,7 @@
 import os
 import socket
 import struct
+import subprocess
 import threading
 import time
 import serial
@@ -253,7 +254,254 @@ class CommManager(QObject):
             time.sleep(0.01)
 
     def scan_for_devices(self):
-        pass
+        def _scan():
+            networks = []
+            wlan_ok = False
+            try:
+                svc_out = subprocess.check_output(
+                    "sc query WlanSvc",
+                    shell=True,
+                    stderr=subprocess.STDOUT,
+                    timeout=5,
+                ).decode("gbk", errors="ignore")
+                if "RUNNING" in svc_out or "运行" in svc_out or ("STATE" in svc_out and "4" in svc_out):
+                    wlan_ok = True
+                else:
+                    ret = subprocess.call(
+                        "net start WlanSvc",
+                        shell=True,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                    wlan_ok = (ret == 0)
+            except Exception:
+                pass
+
+            def _try_decode(raw_bytes):
+                for enc in ("utf-8", "gbk", "cp936", "cp437", "latin-1"):
+                    try:
+                        return raw_bytes.decode(enc)
+                    except (UnicodeDecodeError, LookupError):
+                        continue
+                return raw_bytes.decode("latin-1", errors="ignore")
+
+            has_iface = False
+            try:
+                iface_raw = subprocess.check_output(
+                    "netsh wlan show interfaces",
+                    shell=True,
+                    stderr=subprocess.STDOUT,
+                    timeout=5,
+                )
+                iface_out = _try_decode(iface_raw)
+                has_iface = (
+                    "GUID" in iface_out
+                    or "WLAN" in iface_out
+                    or "Wireless" in iface_out
+                    or "接口" in iface_out
+                )
+            except subprocess.CalledProcessError:
+                pass
+            except Exception:
+                has_iface = False
+
+            need_location = False
+            need_admin = False
+            cmds = ["netsh wlan show networks mode=bssid", "netsh wlan show networks"]
+            for cmd in cmds:
+                try:
+                    raw = subprocess.check_output(
+                        cmd,
+                        shell=True,
+                        stderr=subprocess.STDOUT,
+                        timeout=10,
+                    )
+                    output = _try_decode(raw)
+                    for line in output.split("\n"):
+                        line = line.strip()
+                        if (
+                            ("SSID" in line or "网络名" in line)
+                            and "BSSID" not in line
+                            and ":" in line
+                        ):
+                            parts = line.split(":", 1)
+                            if len(parts) > 1:
+                                ssid = parts[1].strip()
+                                if ssid and ssid not in networks:
+                                    networks.append(ssid)
+                    if networks:
+                        break
+                except subprocess.CalledProcessError as e:
+                    err = _try_decode(e.output) if e.output else ""
+                    if "位置" in err or "location" in err.lower():
+                        need_location = True
+                    if (
+                        "管理员" in err
+                        or "提升" in err
+                        or "admin" in err.lower()
+                        or "elevat" in err.lower()
+                    ):
+                        need_admin = True
+                except Exception:
+                    pass
+
+            if not networks:
+                try:
+                    import pywifi
+                    wifi = pywifi.PyWiFi()
+                    ifaces = wifi.interfaces()
+                    if ifaces:
+                        for iface in ifaces:
+                            iface.scan()
+                            time.sleep(3)
+                            for r in iface.scan_results():
+                                ssid = r.ssid.strip()
+                                if ssid and ssid not in networks:
+                                    networks.append(ssid)
+                            if networks:
+                                break
+                except ImportError:
+                    pass
+                except Exception:
+                    pass
+
+            if not networks:
+                diag = []
+                if need_location:
+                    diag.append("Windows Location Service disabled - open Settings > Privacy > Location, turn ON")
+                if need_admin:
+                    diag.append("Need Run as Administrator")
+                if not wlan_ok:
+                    diag.append("WlanSvc not running")
+                if not has_iface:
+                    diag.append("No wireless adapter")
+                if not diag:
+                    diag.append("Unknown reason")
+                msg = "[WiFi] SCAN FAILED: " + "; ".join(diag)
+                self.log_message_received.emit(msg)
+
+            self.wifi_scan_finished.emit(networks)
+
+        threading.Thread(target=_scan, daemon=True).start()
 
     def connect_to_ap_and_socket(self, ssid, password):
-        pass
+        def _connect():
+            try:
+                already_connected = False
+                try:
+                    raw = subprocess.check_output(
+                        "netsh wlan show interfaces",
+                        shell=True,
+                        stderr=subprocess.DEVNULL,
+                    )
+                    output = raw.decode("utf-8", errors="ignore")
+                    if ssid not in output:
+                        output = raw.decode("gbk", errors="ignore")
+                    if ssid in output:
+                        already_connected = True
+                except Exception:
+                    pass
+
+                if not already_connected:
+                    subprocess.run(
+                        f'netsh wlan delete profile name="{ssid}"',
+                        shell=True,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                    ssid_hex = ssid.encode("utf-8").hex().upper()
+                    if password:
+                        auth = "WPA2PSK"
+                        encrypt = "AES"
+                        key_section = f"""            <sharedKey>
+                <keyType>passPhrase</keyType>
+                <protected>false</protected>
+                <keyMaterial>{password}</keyMaterial>
+            </sharedKey>"""
+                    else:
+                        auth = "open"
+                        encrypt = "none"
+                        key_section = ""
+
+                    xml = f"""<?xml version="1.0"?>
+<WLANProfile xmlns="http://www.microsoft.com/networking/WLAN/profile/v1">
+    <name>{ssid}</name>
+    <SSIDConfig>
+        <SSID>
+            <hex>{ssid_hex}</hex>
+            <name>{ssid}</name>
+        </SSID>
+        <nonBroadcast>false</nonBroadcast>
+    </SSIDConfig>
+    <connectionType>ESS</connectionType>
+    <connectionMode>auto</connectionMode>
+    <MSM>
+        <security>
+            <authEncryption>
+                <authentication>{auth}</authentication>
+                <encryption>{encrypt}</encryption>
+                <useOneX>false</useOneX>
+            </authEncryption>
+{key_section}
+        </security>
+    </MSM>
+</WLANProfile>"""
+                    with open("temp_wifi.xml", "w", encoding="utf-8-sig") as f:
+                        f.write(xml)
+
+                    result = subprocess.run(
+                        'netsh wlan add profile filename="temp_wifi.xml" user=all',
+                        shell=True,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                    )
+                    if result.returncode != 0:
+                        subprocess.run(
+                            'netsh wlan add profile filename="temp_wifi.xml"',
+                            shell=True,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                        )
+
+                    try:
+                        os.remove("temp_wifi.xml")
+                    except Exception:
+                        pass
+
+                    result = subprocess.run(
+                        f'netsh wlan connect name="{ssid}"',
+                        shell=True,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                    )
+
+                connected = False
+                for i in range(20):
+                    try:
+                        ret = subprocess.call(
+                            "ping -n 1 -w 500 192.168.4.1",
+                            shell=True,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                        )
+                        if ret == 0:
+                            time.sleep(0.5)
+                            try:
+                                self.connect_wifi("192.168.4.1", 8080, silent=True)
+                                if self.is_connected:
+                                    connected = True
+                                    break
+                            except Exception:
+                                time.sleep(1)
+                        else:
+                            time.sleep(1)
+                    except Exception:
+                        time.sleep(1)
+
+                if not connected:
+                    self.connect_wifi("192.168.4.1", 8080, silent=False)
+
+            except Exception as e:
+                self.connection_status_changed.emit(False, str(e))
+
+        threading.Thread(target=_connect, daemon=True).start()
